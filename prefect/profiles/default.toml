@@ -1,0 +1,3 @@
+[profile]
+name = "default"
+api_url = "http://prefect-server:4200/api"

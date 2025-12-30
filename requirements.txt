@@ -1,0 +1,8 @@
+python-dotenv==1.0.1
+mysql-connector-python==8.4.0
+pandas==2.2.2
+feature-engine==1.7.0
+lightgbm==4.5.0
+joblib==1.4.2
+prefect==2.19.3
+structlog==24.1.0

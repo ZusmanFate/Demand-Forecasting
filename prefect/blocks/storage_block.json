@@ -1,0 +1,13 @@
+{
+  "block_documents": [
+    {
+      "name": "demand-local-storage",
+      "data": {
+        "basepath": "/app/data"
+      },
+      "block_type_slug": "local-file-system",
+      "block_schema_slug": "local-file-system",
+      "is_default_storage_block": true
+    }
+  ]
+}

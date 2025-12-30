@@ -1,0 +1,33 @@
+version: "3.9"
+
+services:
+  demand-app:
+    build: .
+    container_name: demand-forecast-app
+    env_file:
+      - .env
+    environment:
+      PREFECT_API_URL: ${PREFECT_API_URL:-http://prefect-server:4200/api}
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./model_file:/app/model_file
+      - ./prefect/profiles:/root/.prefect/profiles
+      - ./prefect/blocks:/app/prefect/blocks
+    depends_on:
+      - prefect-server
+    command: ["prefect", "agent", "start", "--work-queue", "${PREFECT_WORK_QUEUE:-demand-local}"]
+
+  prefect-server:
+    image: prefecthq/prefect:2.19.3-python3.11
+    container_name: prefect-server
+    command: ["prefect", "server", "start", "--host", "0.0.0.0", "--port", "4200"]
+    ports:
+      - "4200:4200"
+    environment:
+      PREFECT_API_URL: http://prefect-server:4200/api
+    volumes:
+      - prefect-data:/root/.prefect
+
+volumes:
+  prefect-data:
