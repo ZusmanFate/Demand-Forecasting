@@ -1,8 +1,24 @@
-python-dotenv==1.0.1
-mysql-connector-python==8.4.0
-pandas==2.2.2
-feature-engine==1.7.0
-lightgbm==4.5.0
-joblib==1.4.2
-prefect==2.19.3
-structlog==24.1.0
+########## Configuration & Logging ##########
+python-dotenv==1.0.1         # 加载 .env 配置
+structlog==24.1.0            # 结构化日志输出
+
+########## Data Processing ##########
+pandas==2.2.2                # CSV 读写与数据处理
+numpy==1.26.4                # 数值计算、Rolling/lag 特征
+pyarrow==17.0.0              # 高性能列式处理、未来可扩展至 Parquet
+matplotlib==3.8.4            # 可视化特征重要性/训练曲线
+feature-engine==1.7.0        # 特征工程增强模块
+chinese-calendar==1.9.0      # 节假日特征依赖
+
+########## Modeling & Optimization ##########
+lightgbm==4.5.0              # 主模型框架
+scikit-learn==1.5.2          # 评估指标、数据拆分
+optuna==3.6.1               # 超参调优
+shap==0.46.0                # 模型解释
+joblib==1.4.2               # 模型持久化
+
+########## Workflow & Orchestration ##########
+prefect==3.4.25             # Prefect 流程调度
+
+########## Database Connectivity ##########
+mysql-connector-python==8.4.0   # StarRocks(MySQL 协议) 读写
