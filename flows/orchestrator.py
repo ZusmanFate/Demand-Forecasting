@@ -48,24 +48,33 @@ class ForecastOrchestrator:
         self.logger.info("✅ pipeline_start", run_date=suffix)
 
         builder = self.builder or FeatureBuilder(raw_csv=raw_csv, feature_csv=feature_csv)
+        future_feature_csv = self.feature_dir / f"future_{suffix}.csv"
         try:
             self.logger.info(
                 "✅ feature_build_start", raw=raw_csv.as_posix(), out=feature_csv.as_posix()
             )
             builder.process()
+            builder.build_future_features(horizon_weeks=4, future_csv_path=future_feature_csv)
             _ensure_file(feature_csv)
             if raw_csv.exists():
                 self.backup_manager.backup_csv_files("raw", suffix, [raw_csv])
             self.backup_manager.backup_csv_files("feature", suffix, [feature_csv])
+            self.backup_manager.backup_csv_files("future_feature", suffix, [future_feature_csv])
             self.logger.info("✅ feature_build_complete", feature_csv=feature_csv.as_posix())
         except Exception as exc:
             self.logger.error("❌ feature_build_failed", error=str(exc))
             raise
 
         runner = self.runner or LightGBMRunner()
+        future_forecast_csv = self.forecast_dir / f"future_forecast_{suffix}.csv"
         try:
             self.logger.info("✅ model_run_start", feature_csv=feature_csv.as_posix())
-            runner.train_and_predict(feature_csv, forecast_csv)
+            runner.train_and_predict(
+                feature_csv,
+                forecast_csv,
+                future_feature_csv_path=future_feature_csv,
+                future_forecast_csv_path=future_forecast_csv,
+            )
             _ensure_file(forecast_csv)
             metrics = runner.get_model_metrics()
             self.logger.info(
@@ -76,11 +85,15 @@ class ForecastOrchestrator:
             raise
 
         sanitized = runner.export_forecast_to_starrocks_format(forecast_csv)
+        future_forecast_path = runner.get_future_forecast_path()
         self.backup_manager.backup_csv_files("forecast", suffix, [sanitized])
+        if future_forecast_path and future_forecast_path.exists():
+            self.backup_manager.backup_csv_files("forecast_future", suffix, [future_forecast_path])
         self.backup_manager.cleanup_old_backups()
         self.logger.info(
             "✅ pipeline_complete",
             sanitized_csv=sanitized.as_posix(),
+            future_forecast=future_forecast_path.as_posix() if future_forecast_path else None,
             run_date=suffix,
         )
         return sanitized

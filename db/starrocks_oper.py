@@ -31,6 +31,11 @@ FORECAST_COLUMNS = (
     "rmse",
 )
 
+FUTURE_FORECAST_COLUMNS = (
+    "week_end_date",
+    "total_weekly_sales",
+)
+
 
 def _default_conn_kwargs() -> Dict[str, Any]:
     return {
@@ -149,6 +154,40 @@ class StarRocksOper:
             table=table_name,
             rows=affected,
             path=forecast_csv_path.as_posix(),
+        )
+        return affected
+
+    def write_future_forecast_to_starrocks(
+        self,
+        future_csv_path: Path,
+        table_name: str = "forecast_result",
+        batch_size: int = 200,
+    ) -> int:
+        if not future_csv_path.exists():
+            raise FileNotFoundError(f"Future forecast CSV not found: {future_csv_path}")
+        df = pd.read_csv(future_csv_path)
+        missing = sorted(set(FUTURE_FORECAST_COLUMNS) - set(df.columns))
+        if missing:
+            raise KeyError(f"Future forecast CSV missing columns: {missing}")
+        df["week_end_date"] = pd.to_datetime(df["week_end_date"]).dt.strftime("%Y-%m-%d")
+        rows = df[list(FUTURE_FORECAST_COLUMNS)].values.tolist()
+        if not rows:
+            raise ValueError("Future forecast CSV contains no records to import")
+
+        insert_sql = self._build_insert_sql(table_name, FUTURE_FORECAST_COLUMNS)
+        affected = 0
+        with self._connect() as connection:
+            cursor = connection.cursor()
+            for start in range(0, len(rows), batch_size):
+                batch = rows[start : start + batch_size]
+                cursor.executemany(insert_sql, batch)
+                affected += cursor.rowcount
+            connection.commit()
+        self.logger.info(
+            "future_forecast_import_finished",
+            table=table_name,
+            rows=affected,
+            path=future_csv_path.as_posix(),
         )
         return affected
 

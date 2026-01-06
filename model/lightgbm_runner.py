@@ -171,6 +171,7 @@ class LightGBMRunner:
         default_factory=lambda: structlog.get_logger("lightgbm_runner")
     )
     _last_metrics: Optional[Dict[str, float]] = field(default=None, init=False, repr=False)
+    _last_future_forecast_path: Optional[Path] = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         self._verify_dependencies()
@@ -180,7 +181,14 @@ class LightGBMRunner:
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
-    def train_and_predict(self, feature_csv_path: Path, forecast_csv_path: Path) -> Path:
+    def train_and_predict(
+        self,
+        feature_csv_path: Path,
+        forecast_csv_path: Path,
+        *,
+        future_feature_csv_path: Path | None = None,
+        future_forecast_csv_path: Path | None = None,
+    ) -> Path:
         start_time = time.time()
         self.logger.info(
             "✅ training_started",
@@ -241,19 +249,32 @@ class LightGBMRunner:
             self.logger,
         )
 
+        future_forecast_path: Path | None = None
+        if future_feature_csv_path:
+            future_forecast_path = self._run_future_forecast(
+                models,
+                feature_cols,
+                future_feature_csv_path,
+                future_forecast_csv_path,
+            )
+        self._last_future_forecast_path = future_forecast_path
+
         duration = time.time() - start_time
-        self.logger.info(
-            "✅ train_and_predict_completed",
-            forecast_path=forecast_csv_path.as_posix(),
-            model_artifact=model_artifact.as_posix(),
-            importance_paths=[p.as_posix() for p in importance_paths],
-            retrain_rmse=retrain_rmse,
-            cv_rmse=np.mean(val_scores),
-            val_rmse_std=np.std(val_scores),
-            feature_count=len(feature_cols),
-            duration_seconds=duration,
-            plot_path=plot_path.as_posix(),
-        )
+        log_payload = {
+            "forecast_path": forecast_csv_path.as_posix(),
+            "model_artifact": model_artifact.as_posix(),
+            "importance_paths": [p.as_posix() for p in importance_paths],
+            "retrain_rmse": retrain_rmse,
+            "cv_rmse": np.mean(val_scores),
+            "val_rmse_std": np.std(val_scores),
+            "feature_count": len(feature_cols),
+            "duration_seconds": duration,
+            "plot_path": plot_path.as_posix(),
+        }
+        if future_forecast_path is not None:
+            log_payload["future_forecast_path"] = future_forecast_path.as_posix()
+
+        self.logger.info("✅ train_and_predict_completed", **log_payload)
         gc.collect()
         return forecast_csv_path
 
@@ -286,10 +307,28 @@ class LightGBMRunner:
         return df.sort_values(self.date_col).reset_index(drop=True)
 
     def _split_train_test(self, df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
-        train_df = df[df[self.is_train_col]].copy()
-        test_df = df[~df[self.is_train_col]].copy()
-        if train_df.empty or test_df.empty:
-            raise ValueError("Train/Test split resulted in empty dataframe. Check is_train flag.")
+        if "data_split" not in df.columns:
+            raise KeyError("Feature CSV missing 'data_split' column for split assignment")
+
+        train_mask = (df["data_split"] == "train") & (df[self.is_train_col])
+        test_mask = (df["data_split"] == "test") & (~df[self.is_train_col])
+
+        train_df = df[train_mask].copy()
+        test_df = df[test_mask].copy()
+
+        if train_df.empty:
+            raise ValueError("Training dataframe is empty after applying train split filters")
+        if test_df.empty:
+            raise ValueError(
+                "Test dataframe is empty after applying test split filters (expected future 4 weeks)"
+            )
+
+        self.logger.info(
+            "dataset_split_summary",
+            train_rows=len(train_df),
+            test_rows=len(test_df),
+            discard_rows=int((df["data_split"] == "discard_pre_6y").sum()),
+        )
         return train_df.reset_index(drop=True), test_df.reset_index(drop=True)
 
     def _select_feature_columns(self, df: pd.DataFrame) -> List[str]:
@@ -482,6 +521,65 @@ class LightGBMRunner:
     def _average_predictions(self, models: Sequence[lgb.Booster], X_test: pd.DataFrame) -> np.ndarray:
         preds = np.array([model.predict(X_test) for model in models])
         return preds.mean(axis=0)
+
+    def _load_future_features(
+        self, future_csv_path: Path, feature_cols: Sequence[str]
+    ) -> pd.DataFrame:
+        if not future_csv_path.exists():
+            raise FileNotFoundError(f"Future feature CSV not found: {future_csv_path}")
+        future_df = pd.read_csv(future_csv_path)
+        if self.date_col not in future_df.columns:
+            raise KeyError(f"Missing '{self.date_col}' column in future feature CSV")
+        future_df[self.date_col] = pd.to_datetime(future_df[self.date_col])
+
+        # Align derived columns with the training dataframe before validation
+        future_df = add_time_robust_features(future_df, self.date_col)
+        if "is_augmented" not in future_df.columns:
+            future_df["is_augmented"] = 0
+
+        missing = sorted(set(feature_cols) - set(future_df.columns))
+        if missing:
+            raise KeyError(f"Future feature CSV missing columns: {missing}")
+        future_df = future_df.sort_values(self.date_col).reset_index(drop=True)
+        self.logger.info(
+            "future_features_loaded",
+            path=future_csv_path.as_posix(),
+            rows=len(future_df),
+        )
+        return future_df
+
+    def _run_future_forecast(
+        self,
+        models: Sequence[lgb.Booster],
+        feature_cols: Sequence[str],
+        future_feature_csv_path: Path,
+        future_forecast_csv_path: Path | None,
+    ) -> Path:
+        future_df = self._load_future_features(future_feature_csv_path, feature_cols)
+        preds = self._average_predictions(models, future_df[feature_cols])
+        result = pd.DataFrame(
+            {
+                self.date_col: future_df[self.date_col].values,
+                "total_weekly_sales": preds,
+            }
+        )
+        result = result.sort_values(self.date_col).reset_index(drop=True)
+
+        if future_forecast_csv_path is None:
+            future_forecast_csv_path = future_feature_csv_path.with_name(
+                f"forecast_{future_feature_csv_path.stem}.csv"
+            )
+        future_forecast_csv_path.parent.mkdir(parents=True, exist_ok=True)
+        result.to_csv(future_forecast_csv_path, index=False, encoding="utf-8-sig")
+        self.logger.info(
+            "future_forecast_generated",
+            path=future_forecast_csv_path.as_posix(),
+            rows=len(result),
+        )
+        return future_forecast_csv_path
+
+    def get_future_forecast_path(self) -> Optional[Path]:
+        return self._last_future_forecast_path
 
     def _log_metrics(self, forecast_df: pd.DataFrame) -> Dict[str, float]:
         rmse = mean_squared_error(forecast_df[self.target_col], forecast_df["pred_sales"], squared=False)

@@ -177,6 +177,38 @@ class FeatureBuilder:
         )
         return self.feature_csv
 
+    def build_future_features(
+        self,
+        *,
+        horizon_weeks: int = 4,
+        future_csv_path: Path | None = None,
+    ) -> Path:
+        """Create placeholder features for future weeks to feed into inference."""
+
+        if horizon_weeks <= 0:
+            raise ValueError("horizon_weeks must be positive")
+        if not self.feature_csv.exists():
+            raise FileNotFoundError(
+                f"Feature CSV not found at {self.feature_csv}. Run process() first."
+            )
+
+        df = pd.read_csv(self.feature_csv)
+        df[self.date_col] = pd.to_datetime(df[self.date_col])
+        future_df = self._generate_future_rows(df, horizon_weeks)
+
+        if future_csv_path is None:
+            future_csv_path = self._default_future_csv_path()
+
+        future_csv_path.parent.mkdir(parents=True, exist_ok=True)
+        future_df.to_csv(future_csv_path, index=False)
+        self.logger.info(
+            "future_feature_csv_written",
+            path=future_csv_path.as_posix(),
+            rows=len(future_df),
+            horizon_weeks=horizon_weeks,
+        )
+        return future_csv_path
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
@@ -223,28 +255,35 @@ class FeatureBuilder:
         lag_periods = (1, 2, 4, 8)
         for period in lag_periods:
             df[f"{self.target_col}_lag_{period}"] = df[self.target_col].shift(period)
+
+        # Use only historical lags for derived diff features to avoid leakage
+        for period in lag_periods:
+            if period == 1:
+                continue
             df[f"lag_{period}_diff"] = (
-                df[self.target_col] - df[f"{self.target_col}_lag_{period}"]
+                df[f"{self.target_col}_lag_1"] - df[f"{self.target_col}_lag_{period}"]
             )
 
-        # Rolling statistics
+        shifted_target = df[self.target_col].shift(1)
         for window in (4, 8, 12, 26):
             df[f"rolling_mean_{window}"] = (
-                df[self.target_col].rolling(window=window, min_periods=1).mean()
+                shifted_target.rolling(window=window, min_periods=1).mean()
             )
             df[f"rolling_std_{window}"] = (
-                df[self.target_col].rolling(window=window, min_periods=2).std().fillna(0.0)
+                shifted_target.rolling(window=window, min_periods=2).std().fillna(0.0)
             )
 
-        df["pct_change_1w"] = df[self.target_col].pct_change(periods=1).fillna(0.0)
-        df["pct_change_4w"] = df[self.target_col].pct_change(periods=4).fillna(0.0)
+        df["pct_change_1w"] = shifted_target.pct_change(periods=1).fillna(0.0)
+        df["pct_change_4w"] = shifted_target.pct_change(periods=4).fillna(0.0)
         df["rolling_mean_ratio_4_12"] = (
             df["rolling_mean_4"] / (df["rolling_mean_12"].replace(0, np.nan))
         ).fillna(1.0)
 
-        rolling_mean_12 = df[self.target_col].rolling(12, min_periods=2).mean()
-        rolling_std_12 = df[self.target_col].rolling(12, min_periods=2).std().replace(0, np.nan)
-        df["target_zscore"] = ((df[self.target_col] - rolling_mean_12) / rolling_std_12).fillna(0.0)
+        rolling_mean_12 = df["rolling_mean_12"]
+        rolling_std_12 = df["rolling_std_12"].replace(0, np.nan)
+        df["target_zscore"] = (
+            (df[f"{self.target_col}_lag_1"] - rolling_mean_12) / rolling_std_12
+        ).fillna(0.0)
 
         self.logger.info("statistical_features_added")
         return df
@@ -291,3 +330,71 @@ class FeatureBuilder:
         df[numeric_cols] = df[numeric_cols].fillna(0.0)
         df = df.sort_values(self.date_col).reset_index(drop=True)
         return df
+
+    # ------------------------------------------------------------------
+    # Future feature helpers
+    # ------------------------------------------------------------------
+    def _default_future_csv_path(self) -> Path:
+        current_name = self.feature_csv.stem
+        if current_name.startswith("feature_"):
+            replacement = current_name.replace("feature_", "future_", 1)
+        else:
+            replacement = f"{current_name}_future"
+        return self.feature_csv.with_name(f"{replacement}{self.feature_csv.suffix}")
+
+    def _generate_future_rows(self, df: pd.DataFrame, horizon_weeks: int) -> pd.DataFrame:
+        if df.empty:
+            raise ValueError("Cannot generate future features from empty dataframe")
+
+        last_row = df.iloc[-1].copy()
+        last_date = pd.to_datetime(last_row[self.date_col])
+        elapsed_base = int(last_row.get("elapsed_weeks", len(df) - 1))
+        min_year = int(df[self.date_col].dt.year.min())
+        max_future_year = int((last_date + pd.DateOffset(weeks=horizon_weeks)).year)
+        holidays = load_chinese_holidays(min_year, max_future_year, logger=self.logger)
+
+        future_rows: list[pd.Series] = []
+        future_dates: list[pd.Timestamp] = []
+        for step in range(1, horizon_weeks + 1):
+            new_row = last_row.copy()
+            new_date = last_date + pd.DateOffset(weeks=step)
+            future_dates.append(new_date)
+
+            new_row[self.date_col] = new_date
+            new_row[self.target_col] = 0.0
+            new_row["data_split"] = "future"
+            new_row["is_train"] = False
+            new_row["elapsed_weeks"] = elapsed_base + step
+
+            temporal = self._temporal_features_for_date(df[self.date_col].min(), new_date)
+            for key, value in temporal.items():
+                if key in new_row:
+                    new_row[key] = value
+
+            future_rows.append(new_row)
+
+        holiday_features = calc_holiday_features(pd.Series(future_dates), holidays, logger=self.logger)
+        for idx, col in enumerate(holiday_features.columns):
+            values = holiday_features[col].tolist()
+            for row_idx, value in enumerate(values):
+                future_rows[row_idx][col] = value
+
+        future_df = pd.DataFrame(future_rows)
+        future_df[self.date_col] = pd.to_datetime(future_df[self.date_col])
+        return future_df
+
+    @staticmethod
+    def _temporal_features_for_date(
+        min_date: pd.Timestamp, new_date: pd.Timestamp
+    ) -> Dict[str, int | float]:
+        return {
+            "year": new_date.year,
+            "month": new_date.month,
+            "quarter": new_date.quarter,
+            "weekofyear": int(new_date.isocalendar().week),
+            "weekofmonth": ((new_date.day - 1) // 7) + 1,
+            "is_month_start": int(new_date.is_month_start),
+            "is_month_end": int(new_date.is_month_end),
+            "days_in_month": new_date.days_in_month,
+            "elapsed_weeks": int(((new_date - min_date).days) // 7),
+        }

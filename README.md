@@ -18,7 +18,7 @@ demand_forecast_light/
 │   └── lightgbm_runner.py      # LightGBM 训练、调参、结果输出
 ├── flows/
 │   ├── orchestrator.py         # 本地 orchestrator 脚本
-│   └── prefect_forecast_flow.py# Prefect Flow（任务拆分、调度、监控）
+│   └── prefect_forecast_flow.py# Prefect Flow（拆分任务、调度、未来预测入库）
 ├── data/
 │   ├── raw/                    # StarRocks 导出的原始 CSV
 │   ├── feature/                # 特征 CSV（FeatureBuilder 输出）
@@ -43,6 +43,7 @@ demand_forecast_light/
    STARROCKS_DB=datasense_dlink_erpservice
    STARROCKS_EXPORT_SQL="WITH ..."  # 见实际 SQL
    STARROCKS_IMPORT_TABLE=weekly_sales_forecast
+   STARROCKS_FUTURE_TABLE=forecast_result
 
    # 数据目录
    BASE_DATA_DIR=data
@@ -67,6 +68,7 @@ python flows/orchestrator.py
 2. `feature/FeatureBuilder.process()` 生成特征 CSV
 3. `model/LightGBMRunner.train_and_predict()` 训练+预测
 4. `StarRocksOper.write_forecast_data_to_starrocks()` 写回数据库
+5. `StarRocksOper.write_future_forecast_to_starrocks()` 将未来 4 周的预测写入 `forecast_result`（可通过 `STARROCKS_FUTURE_TABLE` 覆写表名）。
 
 Prefect 场景推荐使用 `flows/prefect_forecast_flow.py`：
 
@@ -86,6 +88,7 @@ PY
 - **db.starrocks_oper**：
   - `export_raw_data_to_csv`：校验表、执行查询、写出 UTF-8-SIG CSV。
   - `write_forecast_data_to_starrocks`：校验预测 CSV 字段、批量写入目标表。
+  - `write_future_forecast_to_starrocks`：写入未来预测结果到 `forecast_result` 表。
 - **feature.feature_builder.FeatureBuilder**：节假日增强、统计特征、98.7% 时序拆分（最近 6 年训练）并生成特征 CSV。
 - **model.lightgbm_runner.LightGBMRunner**：Optuna 调参、多种子训练、SHAP/重要度、预测 CSV、StarRocks 兼容输出。
 - **flows.orchestrator.ForecastOrchestrator**：本地脚本 orchestrator，串联“原始 CSV → 特征 → 模型 → 预测”，带完整日志与异常处理。
@@ -94,6 +97,7 @@ PY
 - `data/raw/raw_YYYYMMDD.csv`：StarRocks 原始导出（FeatureBuilder 输入）。
 - `data/feature/feature_YYYYMMDD.csv`：特征工程结果。
 - `data/forecast/forecast_YYYYMMDD.csv`：模型预测（含 `week_end_date/total_weekly_sales/pred_sales/error/abs_error/rmse`）。
+- `data/forecast/future_forecast_YYYYMMDD.csv`：未来 4 周 horizon 的预测，仅包含 `week_end_date/pred_sales`。
 - `feature_importance/*.csv|.png`：特征重要度+SHAP 结果。
 - `saved_models/lightgbm_model.pkl`：训练模型与配置 bundle。
 
@@ -101,9 +105,9 @@ PY
 | 问题 | 排查步骤 |
 | --- | --- |
 | `config_loader` 报缺少变量 | 检查 `.env` 是否存在/键名是否一致，或在 `.env` 中补全必填项。
-| `FeatureBuilder` 找不到原始 CSV | 确认 `data/raw/raw_YYYYMMDD.csv` 已生成，文件路径与日期后缀匹配。
-| 模型训练报 ImportError（如 lightgbm/optuna/shap） | 重新执行 `pip install -r requirements.txt`，并确保虚拟环境激活。
-| 写回 StarRocks 失败 | 1) 校验 `forecast_csv` 字段是否完整；2) 检查 StarRocks 连接权限；3) 查看日志中 `starrocks_connection_failed`。
+| `FeatureBuilder` 找不到原始 CSV | 确认 `data/raw/raw_YYYYMMDD.csv` 已生成，文件路径与日期后缀匹配.
+| 模型训练报 ImportError（如 lightgbm/optuna/shap） | 重新执行 `pip install -r requirements.txt`，并确保虚拟环境激活.
+| 写回 StarRocks 失败 | 1) 校验 `forecast_csv` 字段是否完整；2) 检查 StarRocks 连接权限；3) 查看日志中 `starrocks_connection_failed`.
 | Prefect Flow 无法运行 | 确保 Prefect API/工作队列可访问，并在 `.env` 中配置正确.
 
 ## Prefect 部署与监控
@@ -140,14 +144,16 @@ PY
    prefect task-run ls -l 10
    ```
    Prefect UI 中的 Flow Run detail 会展示 `raw_csv / feature_csv / forecast_csv / metrics / rows_written / duration_seconds` 等 summary。
+   Flow 的 summary 会包含 `future_feature_csv/future_forecast_csv/future_rows_written` 字段，用于确认 horizon 结果写入 `forecast_result`.
 
-4. **日志兼容**：Prefect 自动收集 `structlog` 输出，可在 UI 或 `logs/pipeline.log` 中分析；失败 Task 会按配置重试 3 次，间隔 60 秒。
+4. **日志兼容**：Prefect 自动收集 `structlog` 输出，可在 UI 或 `logs/pipeline.log` 中分析；失败 Task 会按配置重试 3 次，间隔 60 秒.
 
-5. **依赖提醒**：Prefect Flow 依赖 `prefect==2.19.3`，已在 `requirements.txt` → Workflow & Orchestration 分类列出。
+5. **依赖提醒**：Prefect Flow 依赖 `prefect==3.4.25`，已在 `requirements.txt` → Workflow & Orchestration 分类列出.
 
 ---
 ## Terraform/Docker/CI 适配
-- 所有路径基于 `pathlib.Path`，兼容 Linux/Windows。
+- 所有路径基于 `pathlib.Path`，兼容 Linux/Windows.
+- `.env` 由 `python-dotenv` 读取，可被容器/CI 通过环境变量覆写.
 - `.env` 由 `python-dotenv` 读取，可被容器/CI 通过环境变量覆写。
 - 日志统一使用 structlog，便于后续接入 ELK、Datadog 等.
 

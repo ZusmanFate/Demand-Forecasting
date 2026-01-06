@@ -69,9 +69,8 @@ def export_raw_data_task(run_date: str, config: Dict[str, Any]) -> str:
     payload = {"run_date": run_date, "raw_csv": exported.as_posix()}
 
     # ✅ structlog 支持传递上下文字段
-    logger.info("raw_export_completed", **payload)
+    logger.info("raw_export_completed", extra=payload)
 
-    # ✅ Prefect logger 只支持字符串消息，不能展开 kwargs
     prefect_logger.info(
         f"Raw export finished | run_date={run_date} | raw_csv={exported.as_posix()}"
     )
@@ -88,25 +87,31 @@ def export_raw_data_task(run_date: str, config: Dict[str, Any]) -> str:
     tags=COMMON_TAGS,
     log_prints=True,
 )
-def build_feature_task(raw_csv_path: str, run_date: str, config: Dict[str, Any]) -> str:
+def build_feature_task(raw_csv_path: str, run_date: str, config: Dict[str, Any]) -> Dict[str, str]:
     set_request_id(f"prefect-feature-{run_date}")
     logger = structlog.get_logger("prefect.build_feature")
     prefect_logger = get_run_logger()
     feature_dir = Path(config["paths"]["feature_dir"])
     feature_path = feature_dir / f"feature_{run_date}.csv"
+    future_feature_path = feature_dir / f"future_{run_date}.csv"
 
     builder = FeatureBuilder(raw_csv=Path(raw_csv_path), feature_csv=feature_path)
     output = builder.process()
+    future_output = builder.build_future_features(
+        horizon_weeks=4, future_csv_path=future_feature_path
+    )
     BACKUP_MANAGER.backup_csv_files("feature", run_date, [output])
+    BACKUP_MANAGER.backup_csv_files("future_feature", run_date, [future_output])
 
     payload = {
         "feature_csv": output.as_posix(),
         "input_raw_csv": raw_csv_path,
         "bytes": output.stat().st_size,
+        "future_feature_csv": future_output.as_posix(),
     }
     logger.info("feature_build_completed", extra=payload)
     prefect_logger.info("Feature engineering completed", extra=payload)
-    return output.as_posix()
+    return {"feature_csv": output.as_posix(), "future_feature_csv": future_output.as_posix()}
 
 
 @task(
@@ -117,23 +122,51 @@ def build_feature_task(raw_csv_path: str, run_date: str, config: Dict[str, Any])
     tags=COMMON_TAGS,
     log_prints=True,
 )
-def train_predict_model_task(feature_csv_path: str, run_date: str, config: Dict[str, Any]) -> Dict[str, Any]:
+def train_predict_model_task(
+    feature_csv_path: str,
+    future_feature_csv_path: str,
+    run_date: str,
+    config: Dict[str, Any],
+) -> Dict[str, Any]:
     set_request_id(f"prefect-train-{run_date}")
     logger = structlog.get_logger("prefect.train_predict")
     prefect_logger = get_run_logger()
     forecast_dir = Path(config["paths"]["forecast_dir"])
     forecast_path = forecast_dir / f"forecast_{run_date}.csv"
+    future_forecast_path = forecast_dir / f"future_forecast_{run_date}.csv"
 
     runner = LightGBMRunner()
-    output_path = runner.train_and_predict(Path(feature_csv_path), forecast_path)
+    output_path = runner.train_and_predict(
+        Path(feature_csv_path),
+        forecast_path,
+        future_feature_csv_path=Path(future_feature_csv_path),
+        future_forecast_csv_path=future_forecast_path,
+    )
     metrics = runner.get_model_metrics()
     BACKUP_MANAGER.backup_csv_files("forecast", run_date, [output_path])
+    future_forecast_generated = runner.get_future_forecast_path()
+    if future_forecast_generated and Path(future_forecast_generated).exists():
+        BACKUP_MANAGER.backup_csv_files(
+            "forecast_future", run_date, [Path(future_forecast_generated)]
+        )
 
-    payload = {"forecast_csv": output_path.as_posix(), "metrics": metrics}
-    logger.info("training_prediction_completed", **payload)
-    prefect_logger.info("Model training + prediction completed", **payload)
+    payload = {
+        "forecast_csv": output_path.as_posix(),
+        "metrics": metrics,
+        "future_forecast_csv": (
+            future_forecast_generated.as_posix()
+            if isinstance(future_forecast_generated, Path)
+            else str(future_forecast_generated)
+            if future_forecast_generated
+            else Path(future_forecast_path).as_posix()
+        ),
+    }
+
+    # Modify here: use `extra` to pass additional fields
+    logger.info("training_prediction_completed", extra=payload)
+    prefect_logger.info("Model training + prediction completed", extra=payload)
+
     return payload
-
 
 @task(
     name="Write forecast back to StarRocks",
@@ -152,8 +185,40 @@ def write_forecast_data_task(forecast_csv: str) -> int:
     starrocks = StarRocksOper()
     affected_rows = starrocks.write_forecast_data_to_starrocks(Path(forecast_csv), table_name)
     payload = {"table": table_name, "rows": affected_rows, "forecast_csv": forecast_csv}
-    logger.info("forecast_import_completed", **payload)
-    prefect_logger.info("Forecast loaded into StarRocks", **payload)
+    logger.info("forecast_import_completed", extra=payload)
+    prefect_logger.info(
+        f"Forecast loaded into StarRocks | table={table_name} | rows={affected_rows} | csv={forecast_csv}"
+    )
+    return affected_rows
+
+
+@task(
+    name="Write future forecast horizon",
+    description="Loads the four-week horizon predictions into the lightweight forecast_result table.",
+    retries=TASK_RETRIES,
+    retry_delay_seconds=TASK_RETRY_DELAY_SECONDS,
+    tags=COMMON_TAGS,
+    log_prints=True,
+)
+def write_future_forecast_task(future_forecast_csv: str) -> int:
+    set_request_id("prefect-write-future")
+    logger = structlog.get_logger("prefect.write_future")
+    prefect_logger = get_run_logger()
+    table_name = get_env("STARROCKS_FUTURE_TABLE", "forecast_result")
+
+    starrocks = StarRocksOper()
+    affected_rows = starrocks.write_future_forecast_to_starrocks(
+        Path(future_forecast_csv), table_name
+    )
+    payload = {
+        "table": table_name,
+        "rows": affected_rows,
+        "future_forecast_csv": future_forecast_csv,
+    }
+    logger.info("future_forecast_import_completed", extra=payload)
+    prefect_logger.info(
+        f"Future forecast loaded | table={table_name} | rows={affected_rows} | csv={future_forecast_csv}"
+    )
     return affected_rows
 
 
@@ -176,27 +241,40 @@ def full_forecast_flow(run_date: Optional[str] = None) -> Dict[str, Any]:
     start_time = time.time()
 
     raw_csv = export_raw_data_task(run_date=resolved_run_date, config=config)
-    feature_csv = build_feature_task(raw_csv_path=raw_csv, run_date=resolved_run_date, config=config)
+    feature_payload = build_feature_task(
+        raw_csv_path=raw_csv, run_date=resolved_run_date, config=config
+    )
+    feature_csv = feature_payload["feature_csv"]
+    future_feature_csv = feature_payload["future_feature_csv"]
     model_output = train_predict_model_task(
         feature_csv_path=feature_csv,
+        future_feature_csv_path=future_feature_csv,
         run_date=resolved_run_date,
         config=config,
     )
     affected_rows = write_forecast_data_task(forecast_csv=model_output["forecast_csv"])
+    future_rows = write_future_forecast_task(
+        future_forecast_csv=model_output["future_forecast_csv"]
+    )
 
     duration = time.time() - start_time
     summary = {
         "run_date": resolved_run_date,
         "raw_csv": raw_csv,
         "feature_csv": feature_csv,
+        "future_feature_csv": future_feature_csv,
         "forecast_csv": model_output["forecast_csv"],
+        "future_forecast_csv": model_output["future_forecast_csv"],
         "metrics": model_output["metrics"],
         "rows_written": affected_rows,
+        "future_rows_written": future_rows,
         "duration_seconds": round(duration, 2),
     }
     BACKUP_MANAGER.cleanup_old_backups()
-    LOGGER.info("flow_completed", **summary)
-    flow_logger.info("Flow completed", **summary)
+    LOGGER.info("flow_completed", extra=summary)
+    flow_logger.info(
+        f"Flow completed for {resolved_run_date} | rows_written={affected_rows} | duration={round(duration, 2)}s"
+    )
     return summary
 
 

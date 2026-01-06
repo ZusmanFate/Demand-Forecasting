@@ -10,8 +10,7 @@ __pycache__/
 *.pyo
 *.pyd
 
-# 忽略临时文件、日志
-*.log
+# 忽略临时文件
 *.tmp
 
 # 忽略 Jupyter Notebook 的检查点
